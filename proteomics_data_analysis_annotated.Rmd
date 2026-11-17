@@ -1,0 +1,788 @@
+---
+title: "bioc557_bioinformatics_proteomics"
+author: "Yuming Shi"
+date: "2026-11-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Set Up
+(1) set up working directory to your storage by RStudio -> Session ->  Set Working Directory -> Choose Directory, build a folder named bioinformatics_proteomics, 
+put data in subfolder bioinformatics_proteomics/data,
+build a subfolder bioinformatics_proteomics/figure
+
+> **Tip on folders:** *Session → Set Working Directory* only affects the Console. When you click **Knit**, R always uses the folder where this .Rmd file is saved. Easiest setup: save this .Rmd inside `bioinformatics_proteomics/`, so the paths `data/...` and `figure/...` work in both cases. Check where R is looking with `getwd()`.
+
+(2) import packages
+> **Install packages before class.** From CRAN: `install.packages(c("tidyverse", "missForest", "patchwork", "ggrepel", "gprofiler2", "circlize"))`. From Bioconductor: `BiocManager::install(c("limma", "ComplexHeatmap"))`. An error like *there is no package called ...* means the package is not installed yet. `tidyverse` already contains `readr` and `ggplot2`; loading them again is harmless.
+
+```{r}
+library(readr)
+library(tidyverse)
+library(missForest) #random forest imputation
+library(ggplot2)
+library(ComplexHeatmap)
+library(circlize)         # colour scales for ComplexHeatmap
+library(patchwork) #combine multiple plots from ggplot2
+library(ggrepel) #label dots on volcano plot
+library(limma)
+library(gprofiler2)
+```
+
+## Practice 1 
+(1) import data
+```{r}
+#raw data
+# read_delim() reads a text file; delim = "\t" means columns are separated by tabs (.tsv)
+# data: one row per protein, one column per sample
+# meta: one row per sample (group, tissue, replicate, queen, brood)
+# Error 'file does not exist'? Check getwd() and that the files are in the data/ folder
+data_raw <- read_delim("data/data.tsv", delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+#meta data
+meta <- read_delim("data/meta.tsv", delim = "\t", escape_double = FALSE, trim_ws = TRUE)
+```
+## (2) basic information
+```{r}
+# read_delim() returns a tibble, and tibbles do not keep row names.
+# So we convert to a plain data.frame and move the protein IDs (1st column) into the row names.
+#set the first column as row names
+data_raw <- as.data.frame(data_raw)
+rownames(data_raw) <- data_raw[,1]
+data_raw <- data_raw[,-1]
+
+#dimensions: number of protein, number of sample
+dim(data_raw)
+#view first 5 rows
+head(data_raw)
+
+# is.na() gives TRUE/FALSE for every cell; sum() counts the TRUEs (TRUE = 1, FALSE = 0)
+#count NA
+print(paste("number of NA:", sum(is.na(data_raw))))
+#NA ratio, round to 4 digits
+print(paste("ratio of NA:", round(sum(is.na(data_raw))/(ncol(data_raw)*nrow(data_raw)), 4)))
+
+#intensity range
+range(data_raw, na.rm = TRUE)
+#intensity quantile
+quantile(data_raw, na.rm = TRUE)
+#histogram of intensity distribution
+hist(as.matrix(data_raw))
+
+# Why log2? Raw intensities span several orders of magnitude and are strongly right-skewed
+# (look at the first histogram). After log2 the distribution is roughly symmetric, and
+# differences become fold changes: +1 = 2 times higher, -1 = half.
+#log 2 transformation
+data_log <- log2(data_raw)
+#log 2 intensity range
+range(data_log, na.rm = TRUE)
+#log 2 intensity quantile
+quantile(data_log, na.rm = TRUE)
+#histogram of log 2 intensity distribution
+hist(as.matrix(data_log))
+# Question: compare the two histograms. Which one looks closer to a bell-shaped (normal) distribution?
+# Most statistical tests we use later, including limma, assume roughly normal data.
+```
+## Practice 2 Filtering, Boxplot, PCA
+(1) remove contaminants
+```{r}
+# Contaminants = proteins that do not come from the sample (keratin from skin and dust,
+# trypsin used for digestion, BSA, ...). They are added to the search database so they are not
+# mistaken for bee proteins, and are removed before analysis.
+#contaminants
+contaminants <- read_csv("data/contaminants.tsv")
+#search for contaminants
+# paste(..., collapse = "|") joins all contaminant IDs into one search pattern "ID1|ID2|ID3" ('|' means OR).
+# grep() returns the row numbers whose protein ID matches any of them.
+# grep() also matches parts of names, so it is worth checking: rownames(data_log)[cont_pos]
+cont_pos <- grep(paste(contaminants$contaminants, collapse = "|"), rownames(data_log))
+length(cont_pos) #42 contaminants
+# The minus sign in data_log[-cont_pos, ] removes these rows
+data_cf <- data_log[-cont_pos,]
+#protein 5391 -> 5349
+```
+
+(2) keep lowly missed proteins
+```{r}
+# rowSums(is.na()) counts the NAs of each protein; dividing by the number of samples gives the fraction missing.
+# Proteins missing in most samples carry little information and cannot be imputed reliably.
+#calculate protein missing rate
+missrate_protein <- rowSums(is.na(data_cf))/ncol(data_cf)
+length(which(missrate_protein > 0.7))
+print(paste(length(which(missrate_protein > 0.7)), "protein missing in more than 70% of the samples"))
+
+# The cutoff is applied across all 60 samples (all tissues together).
+# Example: a protein detected only in head (20/60 samples) is missing in 67% of samples, so it is kept.
+# A stricter alternative is to require enough valid values within each tissue or group.
+#keep protein missing in less than 70% of the sample
+data_m70 <- data_cf[missrate_protein < 0.7,]
+```
+(3) boxplot
+```{r}
+# ggplot needs 'long' format: one row per measurement (protein x sample) instead of one column per sample.
+# pivot_longer() does this reshaping. The protein IDs (row names) are dropped here, which is fine for boxplots.
+#convert data frame to long format
+data_m70_long <- data_m70 %>%
+  pivot_longer(cols = 1:ncol(.),
+               names_to = "sample",
+               values_to = "intensity")
+
+# The tissue is the last letter of the sample name: QXB04_QLBL_G -> G = Gut.
+# grep() finds the rows whose sample name contains '_G', '_A' or '_H'.
+#get metadata from sample name
+#tissue
+data_m70_long$tissue <- NA
+data_m70_long$tissue[grep("_G", data_m70_long$sample)] <- "Gut"
+data_m70_long$tissue[grep("_A", data_m70_long$sample)] <- "Abdomen"
+data_m70_long$tissue[grep("_H", data_m70_long$sample)] <- "Head"
+#group
+# substr(x, 7, 10) takes characters 7 to 10: 'QXB04_QLBL_G' -> 'QLBL'
+data_m70_long$group <- substr(data_m70_long$sample, 7, 10)
+
+# How to read a boxplot: thick line = median, box = middle 50% of values,
+# whiskers = up to 1.5 x box height, dots = values beyond the whiskers.
+# If samples are comparable, their boxes line up.
+#tissue labeling 
+ggplot(data = data_m70_long, aes(x = sample, y = intensity, fill = tissue)) +
+  geom_boxplot() +
+  labs(title = "Sample Intensity Range",
+       subtitle = "tissue",
+       x = "sample",
+       y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), #hide x-axis text
+        axis.title = element_text(size = 17), #axis title text size
+        legend.text = element_text(size = 15), #legend text size
+        legend.title = element_text(size = 15), #legend title text size
+        title = element_text(size = 17)) #title text size
+# ggsave(plot = last_plot()) saves the most recently printed ggplot.
+# A safer habit: give the plot a name (p <- ggplot(...)) and use ggsave(plot = p).
+ggsave("figure/boxplot_tissue.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2500, height = 1200)
+
+# facet_grid(~ group) splits the plot into one panel per group;
+# scales = "free_x" lets each panel show only its own samples.
+#facet by group
+ggplot(data = data_m70_long, aes(x = sample, y = intensity, fill = tissue)) +
+  geom_boxplot() +
+  facet_grid(~ group, scales = "free_x", space = "free_x") + #group by group
+  labs(title = "Sample Intensity Range",
+       subtitle = "group + tissue",
+       x = "sample",
+       y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), #hide x-axis text
+        axis.title = element_text(size = 17), #axis title text size
+        legend.text = element_text(size = 15), #legend text size
+        legend.title = element_text(size = 15), #legend title text size
+        title = element_text(size = 17)) #title text size
+ggsave("figure/boxplot_tissue_group.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2500, height = 1200)
+
+# Question: within each tissue, do the boxes line up? Between tissues?
+# Which of the two matters for our analysis? (We will compare groups within one tissue.)
+#facet by tissue
+#assign grouping colors
+group_cols <- c(QRBR = "#FFFFCC", QLBR = "#A1DAB4",
+                QRBL = "#41B6C4", QLBL = "#225EA8")
+ggplot(data = data_m70_long, aes(x = sample, y = intensity, fill = group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = group_cols, name = "Group") +
+  # (scale_colour_manual has no effect here because no colour is mapped; it can be ignored)
+  scale_colour_manual(values = group_cols, guide = "none") +
+  facet_grid(~ tissue, scales = "free_x", space = "free_x") + #group by tissue
+  labs(title = "Sample Intensity Range",
+       subtitle = "tissue + group",
+       x = "sample",
+       y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), #hide x-axis text
+        axis.title = element_text(size = 17), #axis title text size
+        legend.text = element_text(size = 15), #legend text size
+        legend.title = element_text(size = 15), #legend title text size
+        title = element_text(size = 17)) #title text size
+ggsave("figure/boxplot_group_tissue.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2500, height = 1200)
+
+```
+(4) PCA
+```{r}
+
+# PCA cannot handle NA values, so we use only proteins quantified in all 60 samples.
+#make PCA using complete proteins from the three tissues
+data_complete <- data_m70[complete.cases(data_m70),]
+#2341 proteins complete
+
+# prcomp() expects samples in rows and variables (proteins) in columns, so we transpose with t().
+# center = TRUE subtracts each protein's mean; scale. = TRUE divides by its SD, so every protein
+# contributes equally (otherwise the most abundant and variable proteins dominate).
+#transpose data frame, calculate PCs
+pca <- prcomp(t(data_complete), center = TRUE, scale. = TRUE)
+
+#Eigenvalues = Variances = (standard deviations of the principal components)^2 = pca$sdev^2
+#Proportion of variance explained by each component
+ve  <- round(100*pca$sdev^2/sum(pca$sdev^2), 1)
+
+# pca$x holds each sample's coordinates (scores) on each PC.
+# PC1 = the direction of largest variation among samples; PC2 = the next largest, unrelated to PC1.
+#pca$x = PCs
+scores <- as.data.frame(pca$x[, 1:2]) %>%
+    rownames_to_column("sample") %>% #make row names into a column called sample
+    mutate(group  = factor(substr(sample, 7, 10), levels = names(group_cols)), #make a "group" column
+           tissue = substr(sample, 12, 12)) #make a "tissue" column
+
+hulls <- scores %>% 
+  group_by(tissue) %>% #within each tissue
+  slice(chull(PC1, PC2)) #returns the row positions of the points on the convex hull that is the smallest convex shape that encloses all the points
+
+#draw pca plot
+ggplot(scores, aes(PC1, PC2, fill = tissue)) +
+    geom_polygon(data = hulls, aes(colour = tissue), alpha = 0.3, linewidth = 0.6) +
+    geom_point(shape = 21, size = 3, colour = "black", stroke = 0.6) +
+    labs(title = "PCA - tissue",
+         x = paste0("PC1 (", ve[1], "%)"),
+         y = paste0("PC2 (", ve[2], "%)")) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          plot.title = element_text(hjust = 0.5, size = 14),
+          axis.title = element_text(size = 13),
+          legend.text = element_text(size = 12))
+ggsave("figure/pca_tissue.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 1200, height = 1200)
+
+# Question: what separates the samples along PC1, tissue or treatment group?
+# What does this tell you about the biggest source of variation in the data?
+```
+(5) (optional) PCA within each tissue
+```{r}
+#assign grouping colors
+group_cols <- c(QRBR = "#FFFFCC", QLBR = "#A1DAB4",
+                QRBL = "#41B6C4", QLBL = "#225EA8")
+
+# A function packs the steps above so we can repeat them for each tissue with one line.
+# Each tissue gets its own PCA, so the % variance on the axes differs between panels.
+plot_pca_tissue <- function(mat, tissue_name) {
+  # keep this tissue's samples and proteins quantified in all of them
+  m <- mat[, grepl(paste0("_", substr(tissue_name, 1, 1), "$"), colnames(mat))]
+  m <- m[complete.cases(m), ]
+
+  pca <- prcomp(t(m), center = TRUE, scale. = TRUE)
+  ve  <- round(100 * pca$sdev^2 / sum(pca$sdev^2), 1)
+
+  scores <- as.data.frame(pca$x[, 1:2]) %>%
+    rownames_to_column("sample") %>%
+    mutate(group  = factor(substr(sample, 7, 10), levels = names(group_cols)),
+           tissue = substr(sample, 12, 12))
+
+  hulls <- scores %>% group_by(group) %>% slice(chull(PC1, PC2))
+
+  ggplot(scores, aes(PC1, PC2, fill = group)) +
+    geom_polygon(data = hulls, aes(colour = group), alpha = 0.6, linewidth = 0.6) +
+    geom_point(shape = 21, size = 3, colour = "black", stroke = 0.6) +
+    scale_fill_manual(values = group_cols, name = "Group") +
+    scale_colour_manual(values = group_cols, guide = "none") +
+    facet_wrap(~ tissue) +
+    labs(x = paste0("PC1 (", ve[1], "%)"),
+         y = paste0("PC2 (", ve[2], "%)")) +
+    theme_bw() +
+    theme(aspect.ratio = 1,
+          strip.text = element_text(size = 13),
+          axis.title = element_text(size = 13),
+          legend.text = element_text(size = 12))
+}
+# The '|' between plots comes from patchwork: it places plots side by side;
+# plot_layout(guides = "collect") merges the three legends into one.
+# all three tissues side by side, one shared legend
+p_pca_all <- (plot_pca_tissue(data_m70, "A") |
+              plot_pca_tissue(data_m70, "G") |
+              plot_pca_tissue(data_m70, "H")) +
+  plot_layout(guides = "collect")
+p_pca_all
+ggsave("figure/pca_group.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 3600, height = 1200)
+
+# Question: in which tissue do the treatment groups separate best?
+# Keep this in mind when you see the number of DEPs later.
+```
+
+## Normalization
+> **Normalization** removes technical differences between samples, e.g. slightly different amounts of protein loaded. DIA-NN already normalized this data during the search, so here we first **check** whether more normalization is needed, by measuring how far apart the sample medians are within each tissue.
+
+```{r}
+#median offset per tissue
+# median_range = highest minus lowest sample median in each tissue (log2 units).
+# Reminder: a log2 difference d means a fold change of 2^d, e.g. 2^0.2 = 1.15 = 15% higher.
+data_m70_long %>%
+  group_by(tissue, sample) %>% 
+  summarise(med = median(intensity, na.rm = TRUE)) %>%
+  summarise(median_range = max(med) - min(med))
+
+# Same calculation, using only proteins quantified in ALL samples of that tissue.
+# Why? A sample that detected fewer low-abundance proteins has a higher median simply because
+# its weakest proteins are missing, not because more protein was loaded.
+#median offset of complete proteins
+data_m70 %>%
+  rownames_to_column("protein") %>%
+  pivot_longer(cols = -protein,
+               names_to = "sample",
+               values_to = "intensity") %>%
+  mutate(tissue = recode(substr(sample, 12, 12), A = "Abdomen", G = "Gut", H = "Head")) %>%
+  group_by(tissue) %>%
+  filter(!is.na(intensity)) %>%
+  group_by(tissue, protein) %>%
+  filter(n() == n_distinct(data_m70_long$sample[data_m70_long$tissue == first(tissue)])) %>%
+  group_by(tissue, sample) %>% summarise(med = median(intensity), .groups = "drop_last") %>%
+  summarise(median_range_complete = max(med) - min(med))
+
+# For demonstration: two normalization methods, applied within each tissue separately
+# (tissues have different proteomes, so they should not be forced to look the same).
+# - quantile: forces all samples of a tissue to have exactly the same distribution of values.
+# - scale: makes the sample medians equal
+normalize_by_tissue <- function(mat, method = "quantile") {
+  out <- as.matrix(mat)
+  for (t in c("A", "G", "H")) {
+    idx <- grepl(paste0("_", t, "$"), colnames(out))
+    out[, idx] <- limma::normalizeBetweenArrays(out[, idx], method = method)
+  }
+  out
+}
+
+# quantile normalization
+data_qn <- normalize_by_tissue(data_m70)
+# centered median
+data_mc <- normalize_by_tissue(data_m70, method = "scale")
+
+# Compare these boxplots with the ones before normalization: does either method make a meaningful difference?
+# In the quantile-normalized plot, look at the lowest dots: why are they identical in every sample?
+data_mc %>%
+  as.data.frame() %>%
+  pivot_longer(cols = 1:ncol(.),
+               names_to = "sample",
+               values_to = "intensity") %>%
+  mutate(group  = factor(substr(sample, 7, 10), levels = names(group_cols)),
+           tissue = substr(sample, 12, 12)) %>%
+  ggplot(aes(x = sample, y = intensity, fill = group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = group_cols, name = "Group") +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  facet_grid(~ tissue, scales = "free_x", space = "free_x") + #group by tissue
+  labs(title = "Sample Intensity Range",
+       subtitle = "median centered",
+       x = "sample",
+       y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), #hide x-axis text
+        axis.title = element_text(size = 17), #axis title text size
+        legend.text = element_text(size = 15), #legend text size
+        legend.title = element_text(size = 15), #legend title text size
+        title = element_text(size = 17)) #title text size
+ggsave("figure/boxplot_mc.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2500, height = 1200)
+
+data_qn %>%
+  as.data.frame() %>%
+  pivot_longer(cols = 1:ncol(.),
+               names_to = "sample",
+               values_to = "intensity") %>%
+  mutate(group  = factor(substr(sample, 7, 10), levels = names(group_cols)),
+           tissue = substr(sample, 12, 12)) %>%
+  ggplot(aes(x = sample, y = intensity, fill = group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = group_cols, name = "Group") +
+  scale_colour_manual(values = group_cols, guide = "none") +
+  facet_grid(~ tissue, scales = "free_x", space = "free_x") + #group by tissue
+  labs(title = "Sample Intensity Range",
+       subtitle = "quantile normalization",
+       x = "sample",
+       y = "log2 intensity") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), #hide x-axis text
+        axis.title = element_text(size = 17), #axis title text size
+        legend.text = element_text(size = 15), #legend text size
+        legend.title = element_text(size = 15), #legend title text size
+        title = element_text(size = 17)) #title text size
+ggsave("figure/boxplot_qn.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2500, height = 1200)
+```
+> **Conclusion for our data:** using complete proteins, sample medians differ by at most 0.22 log2 (about 16%) within each tissue, which is small. We therefore continue with the DIA-NN normalized data (`data_m70`) without extra normalization.
+
+## Practice 3: Impute missing values and evaluate
+
+**Idea:** We can't check an imputation against real missing values, because we never know their true value.
+So we create missing values on purpose: take proteins with no missing values, hide some of the values,
+impute them, and compare the imputed values with the true ones we hid.
+
+We work in **one tissue (Head)**.
+Imputation is done within one tissue: a protein missing in gut may simply not exist there, so gut samples should not be used to guess head values.
+
+(1) select complete proteins
+```{r}
+#select head proteins
+# grepl("_H$", ...) is TRUE for sample names that end ($ = end of text) with "_H"
+head_mat <- as.matrix(data_m70[, grepl("_H$", colnames(data_m70))])
+
+# proteins quantified in all 20 head samples = our "ground truth"
+true_mat <- head_mat[complete.cases(head_mat), ]
+dim(true_mat)
+
+# how much is actually missing in the real head data?
+real_na_frac <- mean(is.na(head_mat))
+real_na_frac
+```
+
+(2) Randomly mask 10% values to NA
+`type = "MCAR"`: every value has the same chance of being hidden (missing completely at random).
+`type = "MNAR"`: low-intensity values are more likely to be hidden, which is closer to reality
+
+```{r}
+# set.seed() makes the random numbers reproducible, so everyone hides the same values.
+# If you rerun only the mask line below (without set.seed), you get a new random mask.
+set.seed(42) 
+# How the function works: runif() draws a random number between 0 and 1 for every value,
+# and values whose number is below p are set to NA.
+# MNAR: plogis() is an S-shaped curve, so values well below the 25th percentile get p close to 1
+# and high values get p close to 0, like an instrument's detection limit.
+mask_values <- function(m, frac = 0.1, type = c("MCAR", "MNAR")) { 
+  type <- match.arg(type)
+  if (type == "MCAR") {
+    p <- rep(frac, length(m))
+  } else {
+    # probability of being hidden rises below the 25th percentile
+    p <- plogis((quantile(m, 0.25)-m)/0.5)
+    p <- pmin(p*frac/mean(p), 1) # rescale, so frac of values are hidden overall
+  }
+  out <- m
+  out[runif(length(m)) < p] <- NA
+  out
+}
+
+# TRY: change frac (e.g. 0.05, 0.2, real_na_frac) and type ("MCAR" / "MNAR")
+na_mat <- mask_values(true_mat, frac = 0.1, type = "MCAR")
+mask <- is.na(na_mat) # TRUE where we hid a value
+mean(mask) #10.13% masked
+```
+(3) Try three ways of imputation
+
+```{r}
+# 1. Zero: replace every NA with 0
+# On the log2 scale, 0 means intensity 1, far below any real value.
+# This creates huge fake differences: an example of what NOT to do.
+impute_zero <- function(m) {
+  m[is.na(m)] <- 0
+  m
+}
+
+# 2. A random small number from a Gaussian distribution
+#  For each sample: draw from Normal(mean - shift * sd, width * sd)
+# Assumes values are missing because they were too low to detect (as in Perseus),
+# so it fills them with small random values from the low end of each sample's distribution.
+# shift = how far below the mean (in SDs); width = how spread out the random values are.
+impute_downshift <- function(m, shift = 1.8, width = 0.3) {
+  for (j in seq_len(ncol(m))) {
+    miss <- is.na(m[, j])
+    mu <- mean(m[, j], na.rm = TRUE)
+    s <- sd(m[, j], na.rm = TRUE)
+    m[miss, j] <- rnorm(sum(miss), mean = mu - shift * s, sd = width * s)
+  }
+  m
+}
+
+# 3. missForest: predicts each sample's missing values from the other samples
+#    using random forests (proteins are the observations, samples are the variables)
+# Assumes missing values can be predicted from patterns in the other samples
+# (works best when values are missing at random).
+impute_mf <- function(m) {
+  as.matrix(missForest(as.data.frame(m), ntree = 100, verbose = FALSE)$ximp)
+}
+
+#takes about 30-60s
+imputed <- list(Zero = impute_zero(na_mat),
+                Downshift = impute_downshift(na_mat),
+                missForest = impute_mf(na_mat))
+```
+
+(4) Evaluate the performance by NRMSE
+NRMSE = normalized root mean squared error, computed only on the values we hid:
+
+$$\text{NRMSE} = \sqrt{\frac{\text{mean}\big((\text{imputed} - \text{true})^2\big)}{\text{var}(\text{true})}}$$
+0 = perfect recovery. 
+Around 1 = no better than guessing the average. 
+Above 1 = worse than guessing the average.
+
+```{r}
+# Only the hidden positions (mask == TRUE) are compared; all other values were not imputed.
+nrmse <- function(imputed, truth, mask) {
+  sqrt(mean((imputed[mask] - truth[mask])^2) / var(truth[mask]))
+}
+
+results <- data.frame(method = names(imputed),
+                  NRMSE = map_dbl(imputed, nrmse, truth = true_mat, mask = mask))
+results
+
+
+method_levels <- names(imputed)
+
+# imap_dfr() loops over the list 'imputed': .x = the imputed matrix, .y = its name
+# (Zero / Downshift / missForest), and stacks the results into one table for plotting.
+plot_df <- imap_dfr(imputed, ~ tibble(method = .y,
+                                      true = true_mat[mask],
+                                      imputed = .x[mask])) %>%
+  mutate(method = factor(method, levels = method_levels))
+
+# Points on the red dashed line were recovered perfectly.
+# Points below the line were imputed too low, points above too high.
+ggplot(plot_df, aes(x = true, y = imputed)) +
+  geom_point(alpha = 0.3, size = 0.6) +
+  geom_abline(linetype = 2, colour = "firebrick") +   # perfect recovery line
+  facet_wrap(~ method) +
+  labs(x = "True log2 intensity (hidden)", 
+       y = "Imputed log2 intensity") +
+  theme_bw()
+ggsave("figure/imputation.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 3600, height = 1200)
+```
+### Questions
+
+1. Rank the three methods by NRMSE. Look at the scatter plot: *how* is each method wrong (random scatter, or a systematic shift)?
+2. Go back to Step 2, change `type = "MNAR"`, and re-run Steps 2–4. Does the ranking change? Which method's assumption matches MNAR?
+3. Missing values in real proteomics data are mostly MNAR. Does our MCAR test make missForest look better or worse than it would on real data?
+
+
+### practice 4 Differential expression analysis with limma
+We continue with the **imputed head data** from Practice 3.
+```{r}
+head_imp <- impute_mf(head_mat)
+
+#select head metadata
+meta_h <- meta %>%
+  filter(tissue == "H")
+
+# The metadata rows must be in the same order as the data columns.
+# This line should print TRUE 20 times; any FALSE means samples would be assigned to the wrong groups.
+meta_h$sample == colnames(head_imp)
+
+# make design matrix
+# Design matrix: one row per sample, one column per parameter (type design to see it).
+# ~ 0 + group: one column per group, 1 = the sample belongs to this group.
+# + replicate: one column per replicate, so differences between replicates are accounted for
+# before groups are compared (blocking).
+design <-  model.matrix(~ 0 + group + replicate, data = meta_h)
+#fit a linear model for every protein
+fit <- lmFit(head_imp, design)
+# lmFit() fits a linear model to every protein separately: thousands of models at once.
+# Because replicate is in the model, the group coefficients are values for the reference replicate
+# rather than plain group averages; the differences between groups are what matter.
+head(fit$coefficients) #group means for each protein 
+
+#make contrasts
+# Contrasts = the comparisons we want to test. Names must match colnames(design).
+# groupQLBR - groupQRBR = queen lost vs the control (queen and brood present).
+contrast <- makeContrasts(QLBR_vs_QRBR = groupQLBR - groupQRBR,
+                          QRBL_vs_QRBR = groupQRBL - groupQRBR,
+                          QLBL_vs_QRBR = groupQLBL - groupQRBR,
+                          levels = design)
+fit_con <- contrasts.fit(fit, contrast)
+# eBayes() is the key step of limma. With only 5 replicates per group, each protein's own
+# variance estimate is unreliable. eBayes borrows information from all proteins and pulls each
+# protein's variance towards the common trend, giving more stable t-statistics.
+# trend = TRUE: low-intensity proteins are noisier, so the target depends on intensity (plotSA(fit_con) shows this).
+fit_con <- eBayes(fit_con, trend = TRUE)
+
+# no 'coef' argument = F-test across all contrasts in the fit
+# topTable columns:
+#   logFC = log2 fold change, AveExpr = average log2 intensity, t = moderated t-statistic,
+#   F = F-statistic (when several contrasts are tested together), P.Value = raw p-value,
+#   adj.P.Val = Benjamini-Hochberg adjusted p-value, B = log-odds that the protein is differentially expressed.
+res_F <- topTable(fit_con, number = Inf, adjust.method = "BH")
+head(res_F)
+#significant DEPs
+# Why adjust p-values? Testing ~3000 proteins at p < 0.05 gives ~150 false positives by chance alone.
+# adj.P.Val < 0.05 means we expect about 5% of the proteins we call significant to be false positives.
+sig_F <- res_F[res_F$adj.P.Val < 0.05,]
+```
+
+```{r}
+# TRY: change this to any two groups, e.g. "QLBL - QLBR" or "QRBL - QLBR"
+# the first group is the numerator: positive logFC = higher in the first group
+# Remember the 'group' prefix, e.g. "groupQLBL - groupQLBR" (names must match colnames(design)).
+my_contrast <- "groupQLBL - groupQRBR"
+
+contrast_pair  <- makeContrasts(contrasts = my_contrast, levels = design)
+fit_con_pair <- eBayes(contrasts.fit(fit, contrast_pair), trend = TRUE)
+res_pair <- topTable(fit_con_pair, coef = 1, number = Inf, adjust.method = "BH")
+#p.adj <= 0.05, |logFC| > 1
+# Proteins passing both cutoffs: FDR and at least a 2-fold change (|logFC| > 1). Used for GO analysis below.
+sig_pair <- res_pair[res_pair$adj.P.Val <= 0.05 & abs(res_pair$logFC) > 1,]
+head(sig_pair)
+```
+
+#volcano plot
+```{r}
+# case_when() gives each protein a category; conditions are checked in order and the first TRUE wins.
+volcano_df <- res_pair %>%
+  rownames_to_column("protein") %>%
+  mutate(direction = case_when(adj.P.Val < 0.05 & logFC >  1 ~ "Up-regulated",
+                               adj.P.Val < 0.05 & logFC < -1 ~ "Down-regulated",
+                               TRUE ~ "Not significant"),
+         direction = factor(direction,
+                            levels = c("Down-regulated", "Not significant", "Up-regulated")))
+
+count(volcano_df, direction)
+
+top_labels <- volcano_df %>%
+  filter(direction != "Not significant") %>%
+  slice_min(adj.P.Val, n = 15) #mark 15 top DEP
+
+# x-axis = size of the change (fold change), y-axis = strength of evidence (significance).
+# The upper corners hold proteins with large AND significant changes.
+ggplot(volcano_df, aes(logFC, -log10(adj.P.Val), colour = direction)) +
+  geom_point(size = 1, alpha = 0.6) +
+  geom_vline(xintercept = c(-1, 1), linetype = 2, colour = "grey50") +
+  geom_hline(yintercept = -log10(0.05), linetype = 2, colour = "grey50") +
+  geom_text_repel(data = top_labels, aes(label = protein),
+                  size = 3, max.overlaps = 20, show.legend = FALSE) +
+  scale_colour_manual(values = c("Down-regulated"  = "purple",
+                                 "Not significant" = "grey75",
+                                 "Up-regulated"    = "orange")) +
+  labs(title = paste(my_contrast, "(head)"),
+       x = "log2(Fold Change)", y = "-log10(adj.P.Val)", colour = NULL) +
+  # lims() hides points outside -3..3 (R warns 'Removed n rows'); delete this line to see all proteins.
+  lims(x = c(-3,3)) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 15),  #adjust axis text size
+        axis.title = element_text(size = 15), #adjust axis title size
+        legend.text = element_text(size = 13))
+ggsave("figure/volcano.jpeg", plot = last_plot(),
+       device = "jpeg", #figure format
+       dpi = 300, units = "px",
+       width = 2000, height = 1200)
+```
+
+
+# heatmap
+```{r}
+dep_ids <- rownames(res_F)[res_F$adj.P.Val < 0.05]
+if (length(dep_ids) < 10) dep_ids <- rownames(res_F)[1:50] # top 50 by F-test
+length(dep_ids)
+
+# order samples by group so each group sits together
+sample_order <- order(meta_h$group)
+hm_mat <- head_imp[dep_ids, sample_order]
+hm_z <- t(scale(t(hm_mat))) # z-score each protein (row)
+
+col_anno <- HeatmapAnnotation(Group = meta_h$group[sample_order],
+                              col = list(Group = group_cols))
+
+jpeg("figure/heatmap.png", width = 2000, height = 1500, units = "px", res = 300)
+Heatmap(hm_z,
+        name = "z score",
+        col = colorRamp2(c(-3, 0, 3), c("#FCFFA4", "#BB3754", "#000004")),
+        top_annotation = col_anno,
+        column_split = meta_h$group[sample_order],
+        cluster_columns = FALSE, # keep samples in group order
+        cluster_rows = TRUE, # group proteins with similar patterns
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        row_title = paste0("DEPs (n = ", length(dep_ids), ")"))
+dev.off()
+
+```
+
+
+
+
+### Questions
+1. How many DEPs did the F-test find among the 4 groups (`nrow(sig_F)`)?
+2. Change `my_contrast` to other pairs of groups. Which comparison gives the most DEPs?
+3. Why does changing the fold-change cutoff not move the horizontal dashed line?
+
+### Practice 5 GO term enrichment analysis with g:profiler
+```{r}
+# gost() sends the protein list to the g:Profiler web server (internet needed). It converts our IDs to
+# honeybee genes and tests which GO terms are over-represented in our list compared with a background.
+# correction_method = "fdr": adjusts for testing thousands of GO terms.
+# significant = FALSE returns all terms; we keep the significant ones ourselves in the next line.
+# use the proteins detected in our experiment as background, domain_scope = "custom",
+# because MS detects abundant proteins more easily, so some terms look enriched just because they are easy to detect.
+
+bg_head <- rownames(head_imp)
+go_sig_pair <- gost(query = rownames(sig_pair), organism = "amellifera", significant = FALSE, correction_method = "fdr", domain_scope = "custom_annotated", custom_bg = bg_head)
+go_sig_pair <- go_sig_pair$result[go_sig_pair$result$significant == TRUE,]
+
+# GO has three branches: BP = biological process (what the protein takes part in),
+# CC = cellular component (where it is), MF = molecular function (what it does).
+# g:Profiler also returns KEGG, Reactome etc.; here we keep only the GO branches.
+#keep cc, mf, bp
+go_sig_pair <- go_sig_pair[go_sig_pair$source == "GO:BP" |
+                             go_sig_pair$source == "GO:CC" |
+                             go_sig_pair$source == "GO:MF",]
+#sort order
+# Keep the 20 terms with the smallest adjusted p-values
+topgo_sig_pair <- go_sig_pair[order(go_sig_pair$p_value),] %>% top_n(., -20, p_value)
+topgo_sig_pair$source <- factor(topgo_sig_pair$source, levels = c("GO:BP", "GO:CC", "GO:MF"))
+
+# ggplot puts text on an axis in alphabetical order. To control the order, we turn term_name into
+# a factor whose levels are in the order we want (the first level is drawn at the bottom of the y-axis).
+plot_go <- topgo_sig_pair %>%
+  arrange(desc(source), p_value) %>%   # MF, CC, BP; most significant last within each
+  mutate(term_name = factor(term_name, levels = unique(term_name)))
+
+# Gene ratio here = fraction of the GO term's genes found in our list (intersection_size / term_size).
+# Very small terms (2-3 genes) reach high ratios with only 1-2 proteins; filtering term_size >= 5 is common.
+# geom_tile(width = Inf) draws a full-width coloured band behind each term to show its GO branch;
+# it is drawn before the points so the points stay on top.
+# gost() p-values are already adjusted, so the colour shows -log10 adjusted p-value.
+ggplot(plot_go,
+       aes(x = intersection_size/term_size,  #gene ratio
+           y = term_name,
+           size = intersection_size)) +
+  geom_tile(aes(width = Inf, fill = source), alpha = 0.7) + 
+  scale_fill_manual(values = c("azure2", "beige", "darkseagreen2"),
+                    label = c("Biological Process", "Cellular Component", "Molecular Function")) + #set background colors for the three categories
+  geom_point(alpha = 0.7, aes(col = -log10(p_value))) +
+  scale_color_gradient(high="red", low="blue") +
+  
+  labs(x = "Gene Ratio",
+       y = "GO Term",
+       title = paste("Top Enriched GO Terms", my_contrast, sep = "\n"),
+       size = "Number of \nproteins groups",
+       color = bquote(paste("-log"["10"]*"adjusted p-value")),
+       fill = "Category") +
+  guides(color = guide_colorbar(order = 1), #fixed legends order
+         size = guide_legend(order = 2)) +
+  theme_bw() +
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(face = "bold", size = 12),
+        legend.text = element_text(size = 12),
+        legend.title = element_text(face = "bold", size = 12),
+        title = element_text(face = "bold", size = 12))
+ggsave("figure/go_sig_pair.jpeg",
+       plot = last_plot(),
+       device = "jpeg",
+       width = 3000,
+       height = 2000,
+       units = "px",
+       dpi = 300)
+
+```
+
+
+
